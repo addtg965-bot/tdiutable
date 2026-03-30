@@ -1,4 +1,4 @@
-import json, asyncio, os, logging, warnings, time, re, sqlite3
+import json, asyncio, os, logging, warnings, time, re, sqlite3, shutil
 from datetime import datetime
 from typing import Optional
 import pytz
@@ -67,6 +67,9 @@ class SaveFlow(StatesGroup):
     naming = State()
 
 class BroadcastFlow(StatesGroup):
+    waiting = State()
+
+class UploadDbFlow(StatesGroup):
     waiting = State()
 
 # ─────────────────────────────────────────
@@ -1283,6 +1286,97 @@ async def cmd_getdb(message: types.Message):
             types.FSInputFile(DB_FILE),
             caption="✅ bot.db fayli"
         )
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: {e}")
+
+
+# ─── UPLOAD DB ───
+class UploadDbFlow(StatesGroup):
+    waiting = State()
+
+@dp.message(Command("uploaddb"))
+async def cmd_uploaddb(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await state.set_state(UploadDbFlow.waiting)
+    kb = InlineKeyboardBuilder()
+    kb.row(types.InlineKeyboardButton(text="❌ Bekor qilish", callback_data="uploaddb_cancel"))
+    await message.answer(
+        "📤 *bot.db faylini yuboring*\n\n"
+        "⚠️ Mavjud ma'lumotlar bazasi almashtiriladi!\n"
+        "Avval /getdb bilan zaxira oling.",
+        reply_markup=kb.as_markup(), parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "uploaddb_cancel")
+async def cb_uploaddb_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id): return
+    await state.clear()
+    await callback.message.edit_text("❌ Bekor qilindi.")
+
+@dp.message(UploadDbFlow.waiting)
+async def msg_uploaddb_file(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear(); return
+
+    if not message.document:
+        await message.answer("❌ Fayl yuborilmadi. .db fayl yuboring yoki /uploaddb ni qaytadan bosing.")
+        return
+
+    fname = message.document.file_name or ""
+    if not fname.endswith(".db"):
+        await message.answer("❌ Faqat .db fayl qabul qilinadi.")
+        return
+
+    status = await message.answer("⏳ Yuklanmoqda...")
+    try:
+        # Avval zaxira
+        backup_path = DB_FILE + ".bak"
+        if os.path.exists(DB_FILE):
+            shutil.copy2(DB_FILE, backup_path)
+
+        # Faylni yuklab olamiz
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+        file = await bot.get_file(message.document.file_id)
+        await bot.download_file(file.file_path, DB_FILE)
+
+        # Tekshiramiz — yaroqli SQLite faylmi?
+        test_con = sqlite3.connect(DB_FILE)
+        test_con.execute("SELECT name FROM sqlite_master LIMIT 1")
+        test_con.close()
+
+        await state.clear()
+        await status.edit_text(
+            "✅ *bot.db muvaffaqiyatli yuklandi!*\n\n"
+            "♻️ Avto-jadvallarni tiklash uchun botni qayta ishga tushiring yoki /reload buyrug'ini yuboring.",
+            parse_mode="Markdown"
+        )
+        log.info(f"Admin {message.from_user.id} tomonidan bot.db yangilandi")
+
+    except sqlite3.DatabaseError:
+        # Yaroqsiz fayl — zaxirani qaytaramiz
+        if os.path.exists(backup_path):
+            shutil.copy2(backup_path, DB_FILE)
+        await state.clear()
+        await status.edit_text("❌ Bu to'g'ri SQLite fayl emas! Avvalgi baza tiklandi.")
+    except Exception as e:
+        await state.clear()
+        await status.edit_text(f"❌ Xatolik: {e}")
+        log.error(f"uploaddb error: {e}")
+
+
+@dp.message(Command("reload"))
+async def cmd_reload(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    await message.answer("♻️ Avto-jadvallar tiklanmoqda...")
+    try:
+        # Mavjud avto-job larni o'chiramiz
+        for job in scheduler.get_jobs():
+            if job.id.startswith("auto_"):
+                scheduler.remove_job(job.id)
+        # DB dan qayta yuklaymiz
+        restore_auto_schedules()
+        jobs = [j for j in scheduler.get_jobs() if j.id.startswith("auto_")]
+        await message.answer(f"✅ *{len(jobs)}* ta avto-jadval tiklandi!", parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"❌ Xatolik: {e}")
 
